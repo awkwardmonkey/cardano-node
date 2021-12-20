@@ -10,12 +10,8 @@ module Cardano.CLI.Shelley.Output
 import           Cardano.Api
 import           Prelude
 
-import           Data.Text (Text)
-
---import           Cardano.CLI.Shelley.Orphans ()
---import           Cardano.Ledger.Shelley.Scripts ()
---import           Cardano.Slotting.Time (SystemStart (..))
 import           Data.Aeson
+import           Data.Text (Text)
 import           Data.Word
 
 import           Cardano.CLI.Shelley.Orphans ()

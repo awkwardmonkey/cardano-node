@@ -123,7 +123,7 @@ data ShelleyQueryCmdError
       !(FilePath, Word64)
       -- ^ Operational certificate filepath and current count
       !(OpCertCounterFile, Word64)
-      -- ^ Operataional certificate counter filepath and current count
+      -- ^ Operational certificate counter filepath and current count
   | ShelleyQueryCmdWrongKESPeriod
       !(FilePath, Word64)
       -- Operational certificate filepath with its KES period
