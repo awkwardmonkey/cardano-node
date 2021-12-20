@@ -2,20 +2,50 @@
 {-# LANGUAGE FlexibleInstances #-}
 
 module Cardano.CLI.Shelley.Output
-  ( QueryTipLocalState(..)
+  ( QueryKesPeriodInfoOutput (..)
+  , QueryTipLocalState(..)
   , QueryTipLocalStateOutput(..)
   ) where
 
 import           Cardano.Api
 import           Prelude
 
-import           Data.Aeson (FromJSON (..), KeyValue, ToJSON (..), object, pairs, withObject, (.:?),
-                   (.=))
 import           Data.Text (Text)
+
+--import           Cardano.CLI.Shelley.Orphans ()
+--import           Cardano.Ledger.Shelley.Scripts ()
+--import           Cardano.Slotting.Time (SystemStart (..))
+import           Data.Aeson
+import           Data.Word
 
 import           Cardano.CLI.Shelley.Orphans ()
 import           Cardano.Ledger.Shelley.Scripts ()
 import           Cardano.Slotting.Time (SystemStart (..))
+
+data QueryKesPeriodInfoOutput =
+  QueryKesPeriodInfoOutput
+    { qKesInfoCurrentKESPeriod :: Word64
+    -- ^ Genesis KESPeriod
+    , qKesInfoRemainingSlotsInPeriod :: Word64
+    -- ^ Remaining slots in current KESPeriod
+    , qKesInfoLatestOperationalCertNo :: Word64
+    -- ^ The lastest operational certificate number i.e how many times
+    -- a new KES key has been generated.
+    , qKesInfoMaxKesKeyEvolutions :: Word64
+    -- ^ The maximum number of KES key evolutions permitted per KESPeriod
+    , qKesInfoSlotsPerKesPeriod :: Word64
+    }
+
+instance ToJSON QueryKesPeriodInfoOutput where
+  toJSON (QueryKesPeriodInfoOutput currKesPeriod remSlotsInKesPeriod
+                                   latestOpCertNo maxKesEvolutions
+                                   slotsPerKesPeriod) =
+    object [ "currentKesPeriod" .= currKesPeriod
+           , "remainingSlotsInKesPeriod" .= remSlotsInKesPeriod
+           , "latestOperationalCertificateNumber" .= latestOpCertNo
+           , "maxKESEvolutions" .= maxKesEvolutions
+           , "slotsPerKesPeriod" .= slotsPerKesPeriod
+           ]
 
 data QueryTipLocalState mode = QueryTipLocalState
   { era :: AnyCardanoEra
