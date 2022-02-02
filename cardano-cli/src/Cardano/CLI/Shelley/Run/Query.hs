@@ -119,24 +119,7 @@ data ShelleyQueryCmdError
   | ShelleyQueryCmdTextReadError !(FileError InputDecodeError )
   | ShelleyQueryCmdColdKeyReadFileError !(FileError InputDecodeError)
   | ShelleyQueryCmdOpCertCounterReadError !(FileError TextEnvelopeError)
-  | ShelleyQueryCmdCountersNotEqual
-      !(FilePath, Word64)
-      -- ^ Operational certificate filepath and current count
-      !(OpCertCounterFile, Word64)
-      -- ^ Operational certificate counter filepath and current count
-  | ShelleyQueryCmdWrongKESPeriod
-      !(FilePath, Word64)
-      -- Operational certificate filepath with its KES period
-      !Word64
-      -- Calculated KES period based on genesis parameters and current slot
   | ShelleyQueryCmdProtocolStateDecodeFailure
-  | ShelleyQueryCmdNodeStateCounterDifferent
-      Word64
-      -- ^ Operational certificate counter in the protocol state
-      Word64
-      -- ^ Operational certificate counter on disk
-      FilePath
-      -- ^ Operational certificate
   | ShelleyQueryCmdNodeUnknownStakePool
       FilePath
       -- ^ Operational certificate of the unknown stake pool.
@@ -168,22 +151,7 @@ renderShelleyQueryCmdError err =
     ShelleyQueryCmdTextReadError e -> Text.pack $ displayError e
     ShelleyQueryCmdColdKeyReadFileError e -> Text.pack $ displayError e
     ShelleyQueryCmdOpCertCounterReadError e -> Text.pack $ displayError e
-    ShelleyQueryCmdCountersNotEqual (opCertFp, certCount) (OpCertCounterFile counterFp, counterFileCount) ->
-      Text.pack $ "Counters in the node operational certificate at: " <> opCertFp <>
-                  " Count: " <> show certCount <>
-                  " and the node operational certificate counter file at: " <> counterFp <>
-                  " Count: " <> show counterFileCount <>
-                  " are not the same."
-
-    ShelleyQueryCmdWrongKESPeriod (opCertFp, opCertKesPeriod) correctKesPeriod ->
-      Text.pack $ "Node operational certificate at: " <> opCertFp <>
-                  " has an incorrectly specified KES period: " <> show opCertKesPeriod <>
-                  " The correct KES period is: " <> show correctKesPeriod
     ShelleyQueryCmdProtocolStateDecodeFailure -> "Failed to decode the protocol state."
-    ShelleyQueryCmdNodeStateCounterDifferent ptclStateCounter onDiskOpCertCounter opCertFp ->
-      Text.pack $ "The protocol state counter for the operational certificate at: " <> opCertFp <>
-                  " does not agree with the ondisk counter. On disk count: " <> show onDiskOpCertCounter <>
-                  " Protocol state count: " <> show ptclStateCounter
     ShelleyQueryCmdNodeUnknownStakePool nodeOpCert ->
       Text.pack $ "The current count for stake pool specified in the operational certificate at: " <> nodeOpCert <>
                   " was not found. "
@@ -438,46 +406,63 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
 
   chainTip <- liftIO $ getLocalChainTip localNodeConnInfo
 
-  (slotsTillNewKesKey, calculatedKesPeriod) <- opCertKesPeriodCheck opCert chainTip gParams
+  (slotsTillNewKesKey, calculatedKesPeriod, periodCheckDiag) <- opCertKesPeriodCheck opCert chainTip gParams
 
   -- We get the operational certificate counter from the protocol state and check that
   -- it is equivalent to what we have on disk.
 
   let ptclStateQinMode = QueryInEra eInMode . QueryInShelleyBasedEra sbe $ QueryProtocolState
   ptclState <- executeQuery era cModeParams localNodeConnInfo ptclStateQinMode
-  ptclStateCounter <- opCertCounterStateCheck ptclState opCert
+  (ptclStateCounter, opCertCounterStateDiag) <- opCertCounterStateCheck ptclState opCert
 
-  let kesPeriodInfo = O.QueryKesPeriodInfoOutput
-                        { O.qKesInfoCurrentKESPeriod = calculatedKesPeriod
-                        , O.qKesInfoRemainingSlotsInPeriod = slotsTillNewKesKey
-                        , O.qKesInfoLatestOperationalCertNo = ptclStateCounter
-                        , O.qKesInfoMaxKesKeyEvolutions = fromIntegral protocolParamMaxKESEvolutions
-                        , O.qKesInfoSlotsPerKesPeriod = fromIntegral protocolParamSlotsPerKESPeriod
-                        }
-      kesPeriodInfoJSON = encodePretty kesPeriodInfo
-  case mOutFile of
-    Just (OutputFile oFp) ->
-      handleIOExceptT (ShelleyQueryCmdWriteFileError . FileIOError oFp)
-        $ LBS.writeFile oFp kesPeriodInfoJSON
-    Nothing -> liftIO $ LBS.putStrLn kesPeriodInfoJSON
+  let diagnoses = opCertCounterStateDiag ++  [periodCheckDiag]
+
+  if any anyFailureDiagnostic diagnoses
+  then
+    case mOutFile of
+      Just (OutputFile _) -> liftIO $ mapM_ kesOpCertDiagnosticsRender diagnoses
+      Nothing -> liftIO $ mapM_ kesOpCertDiagnosticsRender diagnoses
+  else do
+    let kesPeriodInfo = O.QueryKesPeriodInfoOutput
+                          { O.qKesInfoCurrentKESPeriod = calculatedKesPeriod
+                          , O.qKesInfoRemainingSlotsInPeriod = slotsTillNewKesKey
+                          , O.qKesInfoLatestOperationalCertNo = ptclStateCounter
+                          , O.qKesInfoMaxKesKeyEvolutions = fromIntegral protocolParamMaxKESEvolutions
+                          , O.qKesInfoSlotsPerKesPeriod = fromIntegral protocolParamSlotsPerKESPeriod
+                          }
+        kesPeriodInfoJSON = encodePretty kesPeriodInfo
+
+    liftIO $ mapM_ kesOpCertDiagnosticsRender diagnoses
+
+    case mOutFile of
+      Just (OutputFile oFp) ->
+        handleIOExceptT (ShelleyQueryCmdWriteFileError . FileIOError oFp)
+          $ LBS.writeFile oFp kesPeriodInfoJSON
+      Nothing -> liftIO $ LBS.putStrLn kesPeriodInfoJSON
  where
    -- We first check the operational certificate issue counter's count is
    -- equal to the count in the operational certificate (on disk)
-   opCertCounterOndiskCheck :: OperationalCertificate -> ExceptT ShelleyQueryCmdError IO Word64
+   opCertCounterOndiskCheck
+     :: OperationalCertificate
+     -> ExceptT ShelleyQueryCmdError IO (Word64, KesOpCertDiagnostic)
    opCertCounterOndiskCheck opCert = do
      opCertCounter
        <- firstExceptT ShelleyQueryCmdOpCertCounterReadError
             . newExceptT $ readFileTextEnvelope AsOperationalCertificateIssueCounter opCertCountFile
 
-     let currentOpCertCount =  getOpCertCount opCert
+     let currentOpCertCount = getOpCertCount opCert
          -- Why 'pred'? Because the op cert issue counter tells us what the next
          -- count should be.
          currentOpCertIssueCount = pred $ opCertIssueCount opCertCounter
      if currentOpCertCount == currentOpCertIssueCount
-     then return currentOpCertCount
-     else left $ ShelleyQueryCmdCountersNotEqual
-                  (nodeOpCertFile, currentOpCertCount)
-                  (oCIssueCounter, currentOpCertIssueCount)
+     then
+       let sd = SuccessDiagnostic OpCertCountersAreEqual
+       in return (currentOpCertCount, sd)
+     else
+       let fd = FailureDiagnostic $ CountersNotEqual
+                                      (nodeOpCertFile, currentOpCertCount)
+                                      (oCIssueCounter, currentOpCertIssueCount)
+       in return (currentOpCertCount, fd)
 
    -- Returns the number of slots left until KES key rotation and the KES period.
    -- We check the calculated current KES period based on the current slot and
@@ -486,12 +471,22 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
      :: OperationalCertificate
      -> ChainTip
      -> GenesisParameters
-     -> ExceptT ShelleyQueryCmdError IO (Word64, Word64)
-   opCertKesPeriodCheck _ ChainTipAtGenesis
-                          GenesisParameters{protocolParamSlotsPerKESPeriod} =
-     return ( fromIntegral protocolParamSlotsPerKESPeriod
-            , fromIntegral protocolParamSlotsPerKESPeriod
-            )
+     -> ExceptT ShelleyQueryCmdError IO (Word64, Word64, KesOpCertDiagnostic)
+   opCertKesPeriodCheck opCert ChainTipAtGenesis
+                          GenesisParameters{protocolParamSlotsPerKESPeriod} = do
+     let opCertKesPeriod = fromIntegral $ getKesPeriod opCert
+     if fromIntegral protocolParamSlotsPerKESPeriod == opCertKesPeriod
+     then
+       return ( fromIntegral protocolParamSlotsPerKESPeriod
+              , fromIntegral protocolParamSlotsPerKESPeriod
+              , SuccessDiagnostic KesPeriodsAreEqual
+              )
+     else  return ( fromIntegral protocolParamSlotsPerKESPeriod
+                  , fromIntegral protocolParamSlotsPerKESPeriod
+                  , FailureDiagnostic
+                      $ WrongKESPeriod (nodeOpCertFile, opCertKesPeriod)
+                      $ fromIntegral protocolParamSlotsPerKESPeriod
+                  )
    opCertKesPeriodCheck opCert (ChainTip currSlot _ _)
                         GenesisParameters{protocolParamSlotsPerKESPeriod} = do
 
@@ -501,19 +496,21 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
          opCertKesPeriod = fromIntegral $ getKesPeriod opCert
          slotsTillNewKesKey = slotsPerKesPeriod - remainder
      if calculatedKesPeriod == opCertKesPeriod
-     then return (slotsTillNewKesKey, calculatedKesPeriod)
-     else left $ ShelleyQueryCmdWrongKESPeriod
-                   (nodeOpCertFile, opCertKesPeriod)
-                   calculatedKesPeriod
+     then return (slotsTillNewKesKey, calculatedKesPeriod, SuccessDiagnostic KesPeriodsAreEqual)
+     else
+       let fd = FailureDiagnostic $ WrongKESPeriod
+                                      (nodeOpCertFile, opCertKesPeriod)
+                                      calculatedKesPeriod
+       in return (slotsTillNewKesKey, calculatedKesPeriod, fd)
 
    -- We get the operational certificate counter from the protocol state and check that
    -- it is equivalent to what we have on disk.
    opCertCounterStateCheck
      :: ProtocolState era
      -> OperationalCertificate
-     -> ExceptT ShelleyQueryCmdError IO Word64
+     -> ExceptT ShelleyQueryCmdError IO (Word64, [KesOpCertDiagnostic])
    opCertCounterStateCheck ptclState opCert@(OperationalCertificate _ stakePoolVKey) = do
-    onDiskOpCertCount <- opCertCounterOndiskCheck opCert
+    (onDiskOpCertCount, counterOnDiskDiag) <- opCertCounterOndiskCheck opCert
     case decodeProtocolState ptclState of
       Left _ -> left ShelleyQueryCmdProtocolStateDecodeFailure
       Right chainDepState -> do
@@ -521,20 +518,87 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
         -- should be.
         let PrtclState opCertCounterMap _ _ = Ledger.csProtocol chainDepState
             StakePoolKeyHash blockIssuerHash = verificationKeyHash stakePoolVKey
+
         case Map.lookup (coerce blockIssuerHash) opCertCounterMap of
           Just ptclStateCounter ->
             if ptclStateCounter /= onDiskOpCertCount
-            then left $ ShelleyQueryCmdNodeStateCounterDifferent
-                          ptclStateCounter onDiskOpCertCount nodeOpCertFile
-            else return ptclStateCounter
+            then
+              let fd = FailureDiagnostic $ NodeStateCounterDifferent
+                                             ptclStateCounter
+                                             onDiskOpCertCount
+                                             nodeOpCertFile
+              in return (ptclStateCounter, [fd,counterOnDiskDiag])
+            else
+              let sd = SuccessDiagnostic OpCertCounterMatchesNodeState
+              in return (ptclStateCounter, [sd, counterOnDiskDiag])
           Nothing -> left $ ShelleyQueryCmdNodeUnknownStakePool nodeOpCertFile
 
+   kesOpCertDiagnosticsRender :: KesOpCertDiagnostic -> IO ()
+   kesOpCertDiagnosticsRender diag =
+     case diag of
+       SuccessDiagnostic sd ->
+          let successString :: String = case sd of
+                OpCertCounterMatchesNodeState ->
+                  "Operational certificate's counter agrees with the counter in the node's state"
+                KesPeriodsAreEqual -> "Operational certificate's kes period is correct"
+                OpCertCountersAreEqual -> "Counters in the issue counter and operational certificate are equal"
+          in putStrLn $ "✓ " <> successString
+
+       FailureDiagnostic fd ->
+          let failureString :: String = case fd of
+                NodeStateCounterDifferent ptclStateCounter onDiskOpCertCount nodeOpCertFile' ->
+                 "The protocol state counter for the operational certificate at: " <> nodeOpCertFile' <>
+                 " does not agree with the ondisk counter. On disk count: " <> show onDiskOpCertCount <>
+                 " Protocol state count: " <> show ptclStateCounter
+
+                WrongKESPeriod (nodeOpCertFile', opCertKesPeriod) correctKesPeriod ->
+                  "Node operational certificate at: " <> nodeOpCertFile' <>
+                  " has an incorrectly specified KES period: " <> show opCertKesPeriod <>
+                  " The correct KES period is: " <> show correctKesPeriod
+
+                CountersNotEqual (opCertFp, certCount) (OpCertCounterFile counterFp, counterFileCount) ->
+                  "Counters in the node operational certificate at: " <> opCertFp <>
+                  " Count: " <> show certCount <>
+                  " and the node operational certificate counter file at: " <> counterFp <>
+                  " Count: " <> show counterFileCount <>
+                  " are not the same."
+
+          in putStrLn $ "✗ " <> failureString
+
+data KesOpCertDiagnostic = SuccessDiagnostic SuccessDiagnostic
+                         | FailureDiagnostic FailureDiagnostic
 
 
+anyFailureDiagnostic :: KesOpCertDiagnostic -> Bool
+anyFailureDiagnostic FailureDiagnostic{} = True
+anyFailureDiagnostic SuccessDiagnostic{} = False
+data SuccessDiagnostic
+  = OpCertCounterMatchesNodeState
+  | KesPeriodsAreEqual
+  | OpCertCountersAreEqual
+
+data FailureDiagnostic
+  = NodeStateCounterDifferent
+      Word64
+      -- ^ Operational certificate counter in the protocol state
+      Word64
+      -- ^ Operational certificate counter on disk
+      FilePath
+      -- ^ Operational certificate
+  | WrongKESPeriod
+      !(FilePath, Word64)
+      -- Operational certificate filepath with its KES period
+      !Word64
+      -- Calculated KES period based on genesis parameters and current slot
+  | CountersNotEqual
+      !(FilePath, Word64)
+      -- ^ Operational certificate filepath and current count
+      !(OpCertCounterFile, Word64)
+
+      -- ^ Operational certificate counter filepath and current count
 -- | Query the current and future parameters for a stake pool, including the retirement date.
 -- Any of these may be empty (in which case a null will be displayed).
 --
-
 runQueryPoolParams
   :: AnyConsensusModeParams
   -> NetworkId
