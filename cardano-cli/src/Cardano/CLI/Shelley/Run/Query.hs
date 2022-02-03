@@ -406,7 +406,7 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
 
   chainTip <- liftIO $ getLocalChainTip localNodeConnInfo
 
-  (slotsTillNewKesKey, calculatedKesPeriod, periodCheckDiag) <- opCertKesPeriodCheck opCert chainTip gParams
+  (slotsTillNewKesKey, currentKesPeriod, periodCheckDiag) <- opCertKesPeriodCheck opCert chainTip gParams
 
   -- We get the operational certificate counter from the protocol state and check that
   -- it is equivalent to what we have on disk.
@@ -424,7 +424,7 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
       Nothing -> liftIO $ mapM_ kesOpCertDiagnosticsRender diagnoses
   else do
     let kesPeriodInfo = O.QueryKesPeriodInfoOutput
-                          { O.qKesInfoCurrentKESPeriod = calculatedKesPeriod
+                          { O.qKesInfoCurrentKESPeriod = currentKesPeriod
                           , O.qKesInfoRemainingSlotsInPeriod = slotsTillNewKesKey
                           , O.qKesInfoLatestOperationalCertNo = ptclStateCounter
                           , O.qKesInfoMaxKesKeyEvolutions = fromIntegral protocolParamMaxKESEvolutions
@@ -471,37 +471,60 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
      :: OperationalCertificate
      -> ChainTip
      -> GenesisParameters
-     -> ExceptT ShelleyQueryCmdError IO (Word64, Word64, KesOpCertDiagnostic)
+     -> ExceptT ShelleyQueryCmdError IO ( Word64 -- Slots until we need to generate a new KES key
+                                        , Word64 -- Current Kes period
+                                        , KesOpCertDiagnostic)
    opCertKesPeriodCheck opCert ChainTipAtGenesis
-                          GenesisParameters{protocolParamSlotsPerKESPeriod} = do
+                          GenesisParameters{protocolParamSlotsPerKESPeriod, protocolParamMaxKESEvolutions} = do
      let opCertKesPeriod = fromIntegral $ getKesPeriod opCert
+         slotsPerKesPeriod = fromIntegral protocolParamSlotsPerKESPeriod
+         maxKesEvolutions  = fromIntegral protocolParamMaxKESEvolutions
+         currentKesPeriod = 0 -- We are at genesis
+         kesIntervalStart = 0 -- We are at genesis
+         kesIntervalEnd = maxKesEvolutions
+
      if fromIntegral protocolParamSlotsPerKESPeriod == opCertKesPeriod
      then
-       return ( fromIntegral protocolParamSlotsPerKESPeriod
-              , fromIntegral protocolParamSlotsPerKESPeriod
-              , SuccessDiagnostic KesPeriodsAreEqual
+       return ( slotsPerKesPeriod -- TODO: Do we multiple by the max kes evolutions?
+              , currentKesPeriod
+              , SuccessDiagnostic OpCertCurrentKesPeriodWithinInterval
               )
-     else  return ( fromIntegral protocolParamSlotsPerKESPeriod
-                  , fromIntegral protocolParamSlotsPerKESPeriod
+     else  return ( slotsPerKesPeriod
+                  , currentKesPeriod
                   , FailureDiagnostic
-                      $ WrongKESPeriod (nodeOpCertFile, opCertKesPeriod)
-                      $ fromIntegral protocolParamSlotsPerKESPeriod
+                      $ OpCertKesPeriodOutsideOfCurrentInterval
+                          (nodeOpCertFile, opCertKesPeriod)
+                          kesIntervalStart
+                          kesIntervalEnd
                   )
    opCertKesPeriodCheck opCert (ChainTip currSlot _ _)
-                        GenesisParameters{protocolParamSlotsPerKESPeriod} = do
+                        GenesisParameters{ protocolParamSlotsPerKESPeriod
+                                         , protocolParamMaxKESEvolutions} = do
+     -- We need to check that the KES period of the operational certificate falls
+     -- within the current KES period interval. We can calculate the start of
+     -- current KES period interval we are in by dividing the current KES period
+     -- by protocolParamMaxKESEvolutions. Once we determine the interval we must check
+     -- our KES starting period is within that interval.
 
      let slotsPerKesPeriod = fromIntegral protocolParamSlotsPerKESPeriod
-         (calculatedKesPeriod, remainder) =
-           unSlotNo currSlot `quotRem` slotsPerKesPeriod
+         maxKesEvolutions  = fromIntegral protocolParamMaxKESEvolutions
+         (currentKesPeriod, remainder) = unSlotNo currSlot `quotRem` slotsPerKesPeriod
+         kesIntervalStart = currentKesPeriod `div` maxKesEvolutions
+         kesIntervalEnd = kesIntervalStart + maxKesEvolutions
          opCertKesPeriod = fromIntegral $ getKesPeriod opCert
          slotsTillNewKesKey = slotsPerKesPeriod - remainder
-     if calculatedKesPeriod == opCertKesPeriod
-     then return (slotsTillNewKesKey, calculatedKesPeriod, SuccessDiagnostic KesPeriodsAreEqual)
+
+     -- See OCERT rule in ledger specs
+     if kesIntervalStart >= currentKesPeriod && currentKesPeriod < kesIntervalEnd
+     then return (slotsTillNewKesKey, currentKesPeriod, SuccessDiagnostic OpCertCurrentKesPeriodWithinInterval)
      else
-       let fd = FailureDiagnostic $ WrongKESPeriod
+       let fd = FailureDiagnostic $ OpCertKesPeriodOutsideOfCurrentInterval
                                       (nodeOpCertFile, opCertKesPeriod)
-                                      calculatedKesPeriod
-       in return (slotsTillNewKesKey, calculatedKesPeriod, fd)
+                                      kesIntervalStart
+                                      kesIntervalEnd
+       in return ( slotsTillNewKesKey -- TODO: Do we multiple by the max kes evolutions?
+                 , currentKesPeriod
+                 , fd)
 
    -- We get the operational certificate counter from the protocol state and check that
    -- it is equivalent to what we have on disk.
@@ -540,7 +563,7 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
           let successString :: String = case sd of
                 OpCertCounterMatchesNodeState ->
                   "Operational certificate's counter agrees with the counter in the node's state"
-                KesPeriodsAreEqual -> "Operational certificate's kes period is correct"
+                OpCertCurrentKesPeriodWithinInterval -> "Operational certificate's kes period is within the correct KES period interval"
                 OpCertCountersAreEqual -> "Counters in the issue counter and operational certificate are equal"
           in putStrLn $ "✓ " <> successString
 
@@ -551,10 +574,14 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
                  " does not agree with the ondisk counter. On disk count: " <> show onDiskOpCertCount <>
                  " Protocol state count: " <> show ptclStateCounter
 
-                WrongKESPeriod (nodeOpCertFile', opCertKesPeriod) correctKesPeriod ->
+                OpCertKesPeriodOutsideOfCurrentInterval (nodeOpCertFile', opCertKesPeriod) intervalStart intervalEnd ->
                   "Node operational certificate at: " <> nodeOpCertFile' <>
                   " has an incorrectly specified KES period: " <> show opCertKesPeriod <>
-                  " The correct KES period is: " <> show correctKesPeriod
+                  " The operational certificate's KES period is outside of the current KES period interval. " <>
+                  "The operational certificate's KES period must be greater than or equal to the interval start or " <>
+                  "less than the interval end." <> "\n" <>
+                  "KES period interval start: " <> show intervalStart <> "\n" <>
+                  "KES period interval end: " <> show intervalEnd
 
                 CountersNotEqual (opCertFp, certCount) (OpCertCounterFile counterFp, counterFileCount) ->
                   "Counters in the node operational certificate at: " <> opCertFp <>
@@ -574,7 +601,7 @@ anyFailureDiagnostic FailureDiagnostic{} = True
 anyFailureDiagnostic SuccessDiagnostic{} = False
 data SuccessDiagnostic
   = OpCertCounterMatchesNodeState
-  | KesPeriodsAreEqual
+  | OpCertCurrentKesPeriodWithinInterval
   | OpCertCountersAreEqual
 
 data FailureDiagnostic
@@ -585,11 +612,13 @@ data FailureDiagnostic
       -- ^ Operational certificate counter on disk
       FilePath
       -- ^ Operational certificate
-  | WrongKESPeriod
+  | OpCertKesPeriodOutsideOfCurrentInterval
       !(FilePath, Word64)
-      -- Operational certificate filepath with its KES period
+      -- ^ Operational certificate filepath with its KES period
       !Word64
-      -- Calculated KES period based on genesis parameters and current slot
+      -- ^ Kes Period interval start
+      !Word64
+      -- ^ Kes Period interval end
   | CountersNotEqual
       !(FilePath, Word64)
       -- ^ Operational certificate filepath and current count
