@@ -153,8 +153,9 @@ renderShelleyQueryCmdError err =
     ShelleyQueryCmdOpCertCounterReadError e -> Text.pack $ displayError e
     ShelleyQueryCmdProtocolStateDecodeFailure -> "Failed to decode the protocol state."
     ShelleyQueryCmdNodeUnknownStakePool nodeOpCert ->
-      Text.pack $ "The current count for stake pool specified in the operational certificate at: " <> nodeOpCert <>
-                  " was not found. "
+      Text.pack $ "The stake pool associated with: " <> nodeOpCert <> " was not found. Ensure the correct KES key has been " <>
+                  "specified and that the stake pool is registered. If you have submitted a stake pool registration certificate " <>
+                  "in the current epoch, you must wait until the following epoch for the registration to take place."
 
 
 runQueryCmd :: QueryCmd -> ExceptT ShelleyQueryCmdError IO ()
@@ -480,23 +481,24 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
          slotsPerKesPeriod = fromIntegral protocolParamSlotsPerKESPeriod
          maxKesEvolutions  = fromIntegral protocolParamMaxKESEvolutions
          currentKesPeriod = 0 -- We are at genesis
-         kesIntervalStart = 0 -- We are at genesis
-         kesIntervalEnd = maxKesEvolutions
+         kesPeriodIntervalStart = 0 -- We are at genesis
+         kesPeriodIntervalEnd = maxKesEvolutions
+         slotsTillNewKesKey = kesPeriodIntervalEnd * slotsPerKesPeriod
 
      if fromIntegral protocolParamSlotsPerKESPeriod == opCertKesPeriod
      then
-       return ( slotsPerKesPeriod -- TODO: Do we multiple by the max kes evolutions?
+       return ( slotsTillNewKesKey
               , currentKesPeriod
               , SuccessDiagnostic OpCertCurrentKesPeriodWithinInterval
               )
-     else  return ( slotsPerKesPeriod
-                  , currentKesPeriod
-                  , FailureDiagnostic
-                      $ OpCertKesPeriodOutsideOfCurrentInterval
-                          (nodeOpCertFile, opCertKesPeriod)
-                          kesIntervalStart
-                          kesIntervalEnd
-                  )
+     else return ( slotsPerKesPeriod
+                 , currentKesPeriod
+                 , FailureDiagnostic
+                     $ OpCertKesPeriodOutsideOfCurrentInterval
+                         (nodeOpCertFile, opCertKesPeriod)
+                         kesPeriodIntervalStart
+                         kesPeriodIntervalEnd
+                 )
    opCertKesPeriodCheck opCert (ChainTip currSlot _ _)
                         GenesisParameters{ protocolParamSlotsPerKESPeriod
                                          , protocolParamMaxKESEvolutions} = do
@@ -508,23 +510,33 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
 
      let slotsPerKesPeriod = fromIntegral protocolParamSlotsPerKESPeriod
          maxKesEvolutions  = fromIntegral protocolParamMaxKESEvolutions
-         (currentKesPeriod, remainder) = unSlotNo currSlot `quotRem` slotsPerKesPeriod
-         kesIntervalStart = currentKesPeriod `div` maxKesEvolutions
-         kesIntervalEnd = kesIntervalStart + maxKesEvolutions
-         opCertKesPeriod = fromIntegral $ getKesPeriod opCert
-         slotsTillNewKesKey = slotsPerKesPeriod - remainder
+         currentKesPeriod = unSlotNo currSlot `div` slotsPerKesPeriod
 
-     -- See OCERT rule in ledger specs
-     if kesIntervalStart >= currentKesPeriod && currentKesPeriod < kesIntervalEnd
-     then return (slotsTillNewKesKey, currentKesPeriod, SuccessDiagnostic OpCertCurrentKesPeriodWithinInterval)
-     else
+         kesPeriodIntervalStart = (currentKesPeriod `div` maxKesEvolutions) * maxKesEvolutions
+         kesPeriodIntervalEnd = kesPeriodIntervalStart + maxKesEvolutions
+
+         opCertKesPeriod = fromIntegral $ getKesPeriod opCert
+
+         kesPeriodIntervalEndInSlots = kesPeriodIntervalEnd * slotsPerKesPeriod
+
+         slotsTillNewKesKey = kesPeriodIntervalEndInSlots - unSlotNo currSlot
+
+        -- See OCERT rule in ledger specs
+     if kesPeriodIntervalStart <= opCertKesPeriod &&
+        -- Checks if op cert KES period is less than the interval start
+        opCertKesPeriod < kesPeriodIntervalEnd
+        -- Checks if op cert KES period is less than the interval end
+     then
+       return (slotsTillNewKesKey, currentKesPeriod, SuccessDiagnostic OpCertCurrentKesPeriodWithinInterval)
+     else do
        let fd = FailureDiagnostic $ OpCertKesPeriodOutsideOfCurrentInterval
                                       (nodeOpCertFile, opCertKesPeriod)
-                                      kesIntervalStart
-                                      kesIntervalEnd
-       in return ( slotsTillNewKesKey -- TODO: Do we multiple by the max kes evolutions?
-                 , currentKesPeriod
-                 , fd)
+                                      kesPeriodIntervalStart
+                                      kesPeriodIntervalEnd
+       return ( 0
+              , currentKesPeriod
+              , fd
+              )
 
    -- We get the operational certificate counter from the protocol state and check that
    -- it is equivalent to what we have on disk.
@@ -575,13 +587,11 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
                  " Protocol state count: " <> show ptclStateCounter
 
                 OpCertKesPeriodOutsideOfCurrentInterval (nodeOpCertFile', opCertKesPeriod) intervalStart intervalEnd ->
-                  "Node operational certificate at: " <> nodeOpCertFile' <>
-                  " has an incorrectly specified KES period: " <> show opCertKesPeriod <>
-                  " The operational certificate's KES period is outside of the current KES period interval. " <>
-                  "The operational certificate's KES period must be greater than or equal to the interval start or " <>
-                  "less than the interval end." <> "\n" <>
+                  "Node operational certificate at: " <> nodeOpCertFile' <> " has an incorrectly specified KES period. " <> "\n" <>
+                  "The operational certificate's specified KES period is outside of the current KES period interval." <> "\n" <>
                   "KES period interval start: " <> show intervalStart <> "\n" <>
-                  "KES period interval end: " <> show intervalEnd
+                  "KES period interval end: " <> show intervalEnd <> "\n" <>
+                  "Operational certificate's specified KES period: " <> show opCertKesPeriod
 
                 CountersNotEqual (opCertFp, certCount) (OpCertCounterFile counterFp, counterFileCount) ->
                   "Counters in the node operational certificate at: " <> opCertFp <>
