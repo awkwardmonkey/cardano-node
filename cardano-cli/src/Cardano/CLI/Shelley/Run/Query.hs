@@ -120,6 +120,7 @@ data ShelleyQueryCmdError
   | ShelleyQueryCmdColdKeyReadFileError !(FileError InputDecodeError)
   | ShelleyQueryCmdOpCertCounterReadError !(FileError TextEnvelopeError)
   | ShelleyQueryCmdProtocolStateDecodeFailure
+  | ShelleyQueryCmdSlotToUtcError Text
   | ShelleyQueryCmdNodeUnknownStakePool
       FilePath
       -- ^ Operational certificate of the unknown stake pool.
@@ -148,6 +149,7 @@ renderShelleyQueryCmdError err =
     ShelleyQueryCmdGenesisReadError err' -> Text.pack $ displayError err'
     ShelleyQueryCmdLeaderShipError e -> Text.pack $ displayError e
     ShelleyQueryCmdTextEnvelopeReadError e -> Text.pack $ displayError e
+    ShelleyQueryCmdSlotToUtcError e -> "Failed to convert slot to UTC time: " <> e
     ShelleyQueryCmdTextReadError e -> Text.pack $ displayError e
     ShelleyQueryCmdColdKeyReadFileError e -> Text.pack $ displayError e
     ShelleyQueryCmdOpCertCounterReadError e -> Text.pack $ displayError e
@@ -395,57 +397,75 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
   anyE@(AnyCardanoEra era) <- determineEra cModeParams localNodeConnInfo
   let cMode = consensusModeOnly cModeParams
   sbe <- getSbe $ cardanoEraStyle era
+  case cMode of
+    CardanoMode -> do
+      eInMode <- toEraInMode era cMode
+        & hoistMaybe (ShelleyQueryCmdEraConsensusModeMismatch (AnyConsensusMode cMode) anyE)
 
-  eInMode <- toEraInMode era cMode
-    & hoistMaybe (ShelleyQueryCmdEraConsensusModeMismatch (AnyConsensusMode cMode) anyE)
+      -- We check that the KES period specified in the operational certificate is correct
+      -- based on the KES period defined in the genesis parameters and the current slot number
+      let genesisQinMode = QueryInEra eInMode . QueryInShelleyBasedEra sbe $ QueryGenesisParameters
+          eraHistoryQuery = QueryEraHistory CardanoModeIsMultiEra
+      gParams@GenesisParameters{protocolParamMaxKESEvolutions, protocolParamSystemStart, protocolParamSlotsPerKESPeriod}
+        <- executeQuery era cModeParams localNodeConnInfo genesisQinMode
 
-  -- We check that the KES period specified in the operational certificate is correct
-  -- based on the KES period defined in the genesis parameters and the current slot number
-  let genesisQinMode = QueryInEra eInMode . QueryInShelleyBasedEra sbe $ QueryGenesisParameters
-  gParams@GenesisParameters{protocolParamMaxKESEvolutions, protocolParamSlotsPerKESPeriod}
-    <- executeQuery era cModeParams localNodeConnInfo genesisQinMode
+      chainTip <- liftIO $ getLocalChainTip localNodeConnInfo
 
-  chainTip <- liftIO $ getLocalChainTip localNodeConnInfo
+      (slotsTillNewKesKey, currentKesPeriod, kesIntervalStart, kesIntervalEnd, periodCheckDiag)
+        <- opCertKesPeriodCheck opCert chainTip gParams
+      eraHistory <- firstExceptT ShelleyQueryCmdAcquireFailure . newExceptT $ queryNodeLocalState localNodeConnInfo Nothing eraHistoryQuery
 
-  (slotsTillNewKesKey, currentKesPeriod, periodCheckDiag) <- opCertKesPeriodCheck opCert chainTip gParams
+      let eInfo = toEpochInfo eraHistory
 
-  -- We get the operational certificate counter from the protocol state and check that
-  -- it is equivalent to what we have on disk.
+      kesKeyExpirySlotUtc <- firstExceptT ShelleyQueryCmdSlotToUtcError . hoistEither
+                               $ epochInfoSlotToUTCTime
+                                 eInfo
+                                 (SystemStart protocolParamSystemStart)
+                                 (fromIntegral $ kesIntervalEnd * fromIntegral protocolParamSlotsPerKESPeriod)
+      -- We get the operational certificate counter from the protocol state and check that
+      -- it is equivalent to what we have on disk.
 
-  let ptclStateQinMode = QueryInEra eInMode . QueryInShelleyBasedEra sbe $ QueryProtocolState
-  ptclState <- executeQuery era cModeParams localNodeConnInfo ptclStateQinMode
-  (ptclStateCounter, opCertCounterStateDiag) <- opCertCounterStateCheck ptclState opCert
+      let ptclStateQinMode = QueryInEra eInMode . QueryInShelleyBasedEra sbe $ QueryProtocolState
+      ptclState <- executeQuery era cModeParams localNodeConnInfo ptclStateQinMode
+      (opCertCounter, ptclStateCounter, opCertCounterStateDiag) <- opCertCounterStateCheck ptclState opCert
 
-  let diagnoses = opCertCounterStateDiag ++  [periodCheckDiag]
+      let diagnoses = opCertCounterStateDiag ++  [periodCheckDiag]
 
-  if any anyFailureDiagnostic diagnoses
-  then
-    case mOutFile of
-      Just (OutputFile _) -> liftIO $ mapM_ kesOpCertDiagnosticsRender diagnoses
-      Nothing -> liftIO $ mapM_ kesOpCertDiagnosticsRender diagnoses
-  else do
-    let kesPeriodInfo = O.QueryKesPeriodInfoOutput
-                          { O.qKesInfoCurrentKESPeriod = currentKesPeriod
-                          , O.qKesInfoRemainingSlotsInPeriod = slotsTillNewKesKey
-                          , O.qKesInfoLatestOperationalCertNo = ptclStateCounter
-                          , O.qKesInfoMaxKesKeyEvolutions = fromIntegral protocolParamMaxKESEvolutions
-                          , O.qKesInfoSlotsPerKesPeriod = fromIntegral protocolParamSlotsPerKESPeriod
-                          }
-        kesPeriodInfoJSON = encodePretty kesPeriodInfo
+      if any anyFailureDiagnostic diagnoses
+      then
+        case mOutFile of
+          Just (OutputFile _) -> liftIO $ mapM_ kesOpCertDiagnosticsRender diagnoses
+          Nothing -> liftIO $ mapM_ kesOpCertDiagnosticsRender diagnoses
+      else do
+        let kesPeriodInfo = O.QueryKesPeriodInfoOutput
+                              { O.qKesInfoCurrentKESPeriod = currentKesPeriod
+                              , O.qKesInfoStartKesInterval = kesIntervalStart
+                              , O.qKesInfoStartEndInterval = kesIntervalEnd
+                              , O.qKesInfoRemainingSlotsInPeriod = slotsTillNewKesKey
+                              , O.qKesInfoNodeStateOperationalCertNo = ptclStateCounter
+                              , O.qKesInfoOnDiskOperationalCertNo = opCertCounter
+                              , O.qKesInfoMaxKesKeyEvolutions = fromIntegral protocolParamMaxKESEvolutions
+                              , O.qKesInfoSlotsPerKesPeriod = fromIntegral protocolParamSlotsPerKESPeriod
+                              , O.qKesInfoKesKeyExpiry = kesKeyExpirySlotUtc
+                              }
+            kesPeriodInfoJSON = encodePretty kesPeriodInfo
 
-    liftIO $ mapM_ kesOpCertDiagnosticsRender diagnoses
+        liftIO $ mapM_ kesOpCertDiagnosticsRender diagnoses
 
-    case mOutFile of
-      Just (OutputFile oFp) ->
-        handleIOExceptT (ShelleyQueryCmdWriteFileError . FileIOError oFp)
-          $ LBS.writeFile oFp kesPeriodInfoJSON
-      Nothing -> liftIO $ LBS.putStrLn kesPeriodInfoJSON
+        case mOutFile of
+          Just (OutputFile oFp) ->
+            handleIOExceptT (ShelleyQueryCmdWriteFileError . FileIOError oFp)
+              $ LBS.writeFile oFp kesPeriodInfoJSON
+          Nothing -> liftIO $ LBS.putStrLn kesPeriodInfoJSON
+
+    mode -> left . ShelleyQueryCmdUnsupportedMode $ AnyConsensusMode mode
  where
    -- We first check the operational certificate issue counter's count is
    -- equal to the count in the operational certificate (on disk)
    opCertCounterOndiskCheck
      :: OperationalCertificate
-     -> ExceptT ShelleyQueryCmdError IO (Word64, KesOpCertDiagnostic)
+     -> ExceptT ShelleyQueryCmdError IO ( Word64 -- Operational certificate count
+                                        , KesOpCertDiagnostic)
    opCertCounterOndiskCheck opCert = do
      opCertCounter
        <- firstExceptT ShelleyQueryCmdOpCertCounterReadError
@@ -453,7 +473,7 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
 
      let currentOpCertCount = getOpCertCount opCert
          -- Why 'pred'? Because the op cert issue counter tells us what the next
-         -- count should be.
+         -- count should be. TODO: Double check this.
          currentOpCertIssueCount = pred $ opCertIssueCount opCertCounter
      if currentOpCertCount == currentOpCertIssueCount
      then
@@ -474,6 +494,8 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
      -> GenesisParameters
      -> ExceptT ShelleyQueryCmdError IO ( Word64 -- Slots until we need to generate a new KES key
                                         , Word64 -- Current Kes period
+                                        , Word64 -- Kes period interval start
+                                        , Word64 -- Kes period interval end
                                         , KesOpCertDiagnostic)
    opCertKesPeriodCheck opCert ChainTipAtGenesis
                           GenesisParameters{protocolParamSlotsPerKESPeriod, protocolParamMaxKESEvolutions} = do
@@ -489,10 +511,14 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
      then
        return ( slotsTillNewKesKey
               , currentKesPeriod
+              , kesPeriodIntervalStart
+              , kesPeriodIntervalEnd
               , SuccessDiagnostic OpCertCurrentKesPeriodWithinInterval
               )
      else return ( slotsPerKesPeriod
                  , currentKesPeriod
+                 , kesPeriodIntervalStart
+                 , kesPeriodIntervalEnd
                  , FailureDiagnostic
                      $ OpCertKesPeriodOutsideOfCurrentInterval
                          (nodeOpCertFile, opCertKesPeriod)
@@ -527,7 +553,12 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
         opCertKesPeriod < kesPeriodIntervalEnd
         -- Checks if op cert KES period is less than the interval end
      then
-       return (slotsTillNewKesKey, currentKesPeriod, SuccessDiagnostic OpCertCurrentKesPeriodWithinInterval)
+       return ( slotsTillNewKesKey
+              , currentKesPeriod
+              , kesPeriodIntervalStart
+              , kesPeriodIntervalEnd
+              , SuccessDiagnostic OpCertCurrentKesPeriodWithinInterval
+              )
      else do
        let fd = FailureDiagnostic $ OpCertKesPeriodOutsideOfCurrentInterval
                                       (nodeOpCertFile, opCertKesPeriod)
@@ -535,6 +566,8 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
                                       kesPeriodIntervalEnd
        return ( 0
               , currentKesPeriod
+              , kesPeriodIntervalStart
+              , kesPeriodIntervalEnd
               , fd
               )
 
@@ -543,9 +576,11 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
    opCertCounterStateCheck
      :: ProtocolState era
      -> OperationalCertificate
-     -> ExceptT ShelleyQueryCmdError IO (Word64, [KesOpCertDiagnostic])
+     -> ExceptT ShelleyQueryCmdError IO ( Word64 -- Operational certificate count
+                                        , Word64 -- Ptcl state counter
+                                        , [KesOpCertDiagnostic])
    opCertCounterStateCheck ptclState opCert@(OperationalCertificate _ stakePoolVKey) = do
-    (onDiskOpCertCount, counterOnDiskDiag) <- opCertCounterOndiskCheck opCert
+    (onDiskOpCertCount,  counterOnDiskDiag) <- opCertCounterOndiskCheck opCert
     case decodeProtocolState ptclState of
       Left _ -> left ShelleyQueryCmdProtocolStateDecodeFailure
       Right chainDepState -> do
@@ -562,10 +597,10 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
                                              ptclStateCounter
                                              onDiskOpCertCount
                                              nodeOpCertFile
-              in return (ptclStateCounter, [fd,counterOnDiskDiag])
+              in return (onDiskOpCertCount, ptclStateCounter, [fd,counterOnDiskDiag])
             else
               let sd = SuccessDiagnostic OpCertCounterMatchesNodeState
-              in return (ptclStateCounter, [sd, counterOnDiskDiag])
+              in return (onDiskOpCertCount, ptclStateCounter, [sd, counterOnDiskDiag])
           Nothing -> left $ ShelleyQueryCmdNodeUnknownStakePool nodeOpCertFile
 
    kesOpCertDiagnosticsRender :: KesOpCertDiagnostic -> IO ()
@@ -574,9 +609,9 @@ runQueryKesPeriodInfo (AnyConsensusModeParams cModeParams) network nodeOpCertFil
        SuccessDiagnostic sd ->
           let successString :: String = case sd of
                 OpCertCounterMatchesNodeState ->
-                  "Operational certificate's counter agrees with the counter in the node's state"
+                  "The counters match what is in the node's protocol state"
                 OpCertCurrentKesPeriodWithinInterval -> "Operational certificate's kes period is within the correct KES period interval"
-                OpCertCountersAreEqual -> "Counters in the issue counter and operational certificate are equal"
+                OpCertCountersAreEqual -> "The counters in the operational certificate and operational certificate issue counter file are the same"
           in putStrLn $ "✓ " <> successString
 
        FailureDiagnostic fd ->
@@ -1204,11 +1239,6 @@ runQueryLeadershipSchedule (AnyConsensusModeParams cModeParams) network
       liftIO $ printLeadershipSchedule schedule eInfo (SystemStart $ sgSystemStart shelleyGenesis)
     mode -> left . ShelleyQueryCmdUnsupportedMode $ AnyConsensusMode mode
  where
-  toEpochInfo :: EraHistory CardanoMode -> EpochInfo (Either Text)
-  toEpochInfo (EraHistory _ interpreter) =
-    hoistEpochInfo (first (Text.pack . show ) . runExcept)
-      $ Consensus.interpreterToEpochInfo interpreter
-
   printLeadershipSchedule
     :: Set SlotNo
     -> EpochInfo (Either Text)
@@ -1303,6 +1333,11 @@ queryResult eAcq =
       case eResult of
         Left err -> left . ShelleyQueryCmdLocalStateQueryError $ EraMismatchError err
         Right result -> return result
+
+toEpochInfo :: EraHistory CardanoMode -> EpochInfo (Either Text)
+toEpochInfo (EraHistory _ interpreter) =
+  hoistEpochInfo (first (Text.pack . show ) . runExcept)
+    $ Consensus.interpreterToEpochInfo interpreter
 
 obtainLedgerEraClassConstraints
   :: ShelleyLedgerEra era ~ ledgerera
